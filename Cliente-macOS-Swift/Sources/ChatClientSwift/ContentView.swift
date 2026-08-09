@@ -458,7 +458,9 @@ private struct ConversationPane: View {
                     .frame(width: 34, height: 34)
             }
             .buttonStyle(.borderedProminent)
-            .buttonBorderShape(.circle)
+            // .circle exige macOS 14 y el paquete apunta a macOS 13; con un
+            // marco cuadrado, .capsule se ve igual de redondo.
+            .buttonBorderShape(.capsule)
             .disabled(!canSend)
             .help("Enviar mensaje")
         }
