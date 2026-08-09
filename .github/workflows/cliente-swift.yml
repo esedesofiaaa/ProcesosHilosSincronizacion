@@ -1,0 +1,41 @@
+name: Cliente Swift
+
+# Solo corre cuando cambia el cliente de macOS o este mismo workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cliente-macOS-Swift/**'
+      - '.github/workflows/cliente-swift.yml'
+  pull_request:
+    paths:
+      - 'Cliente-macOS-Swift/**'
+      - '.github/workflows/cliente-swift.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: Cliente-macOS-Swift
+
+jobs:
+  compilar:
+    # Network.framework y SwiftUI solo existen en macOS: este cliente no puede
+    # compilarse en Linux, por eso el runner es una VM de macOS.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versiones de la toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Resolver dependencias
+        run: swift package resolve
+
+      - name: Compilar (debug)
+        run: swift build -v
+
+      - name: Compilar (release)
+        run: swift build -c release

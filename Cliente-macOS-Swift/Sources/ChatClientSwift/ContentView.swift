@@ -83,7 +83,8 @@ struct ContentView: View {
         .frame(minWidth: 1_180, minHeight: 760)
         .onChange(of: client.isProtocolConnected) { isConnected in
             if !isConnected {
-                selectedConversation = nil
+                // Se descarta el borrador porque ya no se puede enviar, pero la
+                // conversación sigue abierta para poder releer el historial.
                 draft = ""
             }
         }
@@ -457,7 +458,10 @@ private struct ConversationPane: View {
                     .frame(width: 34, height: 34)
             }
             .buttonStyle(.borderedProminent)
-            .buttonBorderShape(.circle)
+            // buttonBorderShape(.circle) y (.capsule) exigen macOS 14, y el
+            // paquete apunta a macOS 13; recortar la forma no tiene esa
+            // restricción y con un marco cuadrado da el mismo círculo.
+            .clipShape(Circle())
             .disabled(!canSend)
             .help("Enviar mensaje")
         }
