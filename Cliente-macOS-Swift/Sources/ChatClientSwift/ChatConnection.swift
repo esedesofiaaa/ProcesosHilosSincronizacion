@@ -31,6 +31,9 @@ final class ChatConnection: ObservableObject {
     private var configuredUserID = ""
     private var connectWasSent = false
     private var receiveLoopStarted = false
+    /// requestId → destinatario, para poder retirar el mensaje privado que se
+    /// pintó de forma optimista si el servidor responde ERROR.
+    private var pendingPrivateSends: [String: String] = [:]
 
     func connect(host: String, portText: String, userID: String) {
         let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -54,6 +57,9 @@ final class ChatConnection: ObservableObject {
         }
 
         stopCurrentConnection(recordClosure: false)
+        // Una sesión nueva puede usar otro usuario: el historial anterior ya no
+        // le corresponde.
+        conversationMessages.removeAll()
 
         let newConnection = NWConnection(
             host: NWEndpoint.Host(normalizedHost),
@@ -128,6 +134,7 @@ final class ChatConnection: ObservableObject {
         )
 
         if queued {
+            pendingPrivateSends[requestID] = normalizedRecipient
             appendConversationMessage(
                 ConversationMessage(
                     id: "local-\(requestID)",
@@ -362,6 +369,7 @@ final class ChatConnection: ObservableObject {
         case "ACK":
             let operation = stringValue("operation", in: message) ?? "operación"
             let requestID = stringValue("requestId", in: message) ?? "sin requestId"
+            pendingPrivateSends.removeValue(forKey: requestID)
             appendEvent(
                 .acknowledgement,
                 title: "ACK · \(operation)",
@@ -418,10 +426,19 @@ final class ChatConnection: ObservableObject {
             let code = stringValue("code", in: message) ?? "UNKNOWN_ERROR"
             let serverMessage = stringValue("message", in: message) ?? "Sin detalle del servidor."
             let requestID = stringValue("requestId", in: message) ?? "sin requestId"
+            var detail = "\(serverMessage)\nrequestId: \(requestID)"
+
+            // Si el rechazo corresponde a un privado ya pintado, se retira la
+            // burbuja optimista para no dar por entregado lo que no lo fue.
+            if let recipient = pendingPrivateSends.removeValue(forKey: requestID) {
+                conversationMessages.removeAll { $0.id == "local-\(requestID)" }
+                detail += "\nEl mensaje para \(recipient) no se entregó."
+            }
+
             appendEvent(
                 .error,
                 title: "ERROR · \(code)",
-                detail: "\(serverMessage)\nrequestId: \(requestID)"
+                detail: detail
             )
         default:
             appendEvent(
@@ -436,8 +453,8 @@ final class ChatConnection: ObservableObject {
         let entries = listEntries(
             "groups",
             in: message,
-            identifierKeys: ["groupId", "id", "name"],
-            labelKeys: ["name", "groupName", "groupId", "id"]
+            identifierKeys: ["groupId"],
+            labelKeys: ["name", "groupName", "groupId"]
         )
 
         groups = entries.map { ChatGroup(id: $0.id, name: $0.label) }
@@ -461,8 +478,8 @@ final class ChatConnection: ObservableObject {
         let entries = listEntries(
             "members",
             in: message,
-            identifierKeys: ["userId", "id", "user", "name"],
-            labelKeys: ["userId", "user", "name", "id"]
+            identifierKeys: ["userId"],
+            labelKeys: ["displayName", "name", "userId"]
         )
 
         groupMembers[groupID] = entries.map { ChatUser(id: $0.id) }
@@ -477,8 +494,8 @@ final class ChatConnection: ObservableObject {
         let entries = listEntries(
             "users",
             in: message,
-            identifierKeys: ["userId", "id", "user", "name"],
-            labelKeys: ["userId", "user", "name", "id"]
+            identifierKeys: ["userId"],
+            labelKeys: ["displayName", "name", "userId"]
         )
 
         users = entries.map { ChatUser(id: $0.id) }
@@ -510,15 +527,15 @@ final class ChatConnection: ObservableObject {
             }
 
             let identifier = identifierKeys
-                .compactMap { object[$0] as? String }
-                .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .compactMap { stringValue($0, in: object)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
             guard let identifier else {
                 return nil
             }
 
             let label = labelKeys
-                .compactMap { object[$0] as? String }
-                .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .compactMap { stringValue($0, in: object)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
                 ?? identifier
             return (id: identifier, label: label)
         }
@@ -591,7 +608,10 @@ final class ChatConnection: ObservableObject {
         receiveLoopStarted = false
         isTransportReady = false
         isProtocolConnected = false
-        conversationMessages.removeAll()
+        pendingPrivateSends.removeAll()
+        // Los directorios son estado del servidor y dejan de ser válidos, pero
+        // el historial recibido se conserva: al caerse la conexión es justo
+        // cuando el usuario quiere releer lo que pasó.
         groups.removeAll()
         users.removeAll()
         groupMembers.removeAll()
@@ -627,7 +647,22 @@ final class ChatConnection: ObservableObject {
         "swift-\(UUID().uuidString.lowercased())"
     }
 
-    private func stringValue(_ key: String, in message: [String: Any]) -> String? {
-        message[key] as? String
+}
+
+/// El contrato define estos campos como texto, pero un `messageId` numérico no
+/// debe perderse en silencio: se normaliza a String.
+private func stringValue(_ key: String, in message: [String: Any]) -> String? {
+    guard let rawValue = message[key] else {
+        return nil
     }
+
+    if let text = rawValue as? String {
+        return text
+    }
+
+    if let number = rawValue as? NSNumber {
+        return number.stringValue
+    }
+
+    return nil
 }

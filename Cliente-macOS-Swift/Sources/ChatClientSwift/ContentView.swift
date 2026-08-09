@@ -83,7 +83,8 @@ struct ContentView: View {
         .frame(minWidth: 1_180, minHeight: 760)
         .onChange(of: client.isProtocolConnected) { isConnected in
             if !isConnected {
-                selectedConversation = nil
+                // Se descarta el borrador porque ya no se puede enviar, pero la
+                // conversación sigue abierta para poder releer el historial.
                 draft = ""
             }
         }
