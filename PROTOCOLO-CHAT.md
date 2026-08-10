@@ -58,6 +58,23 @@ Respuesta correcta:
 
 El servidor rechaza el usuario si ya está conectado.
 
+### Sesión única
+
+Solo se admite una sesión activa por usuario. Si llega un `CONNECT` con un `userId` que ya tiene sesión, **la conexión rechazada es la nueva**: la sesión que ya estaba activa se conserva intacta y no se entera del intento.
+
+```json
+{
+  "type": "ERROR",
+  "requestId": "r1",
+  "code": "USER_ALREADY_CONNECTED",
+  "message": "El usuario ya tiene una sesion activa"
+}
+```
+
+Después de responder, el servidor cierra la conexión nueva.
+
+Los `requestId` registrados pertenecen a la sesión: al cerrarse una conexión se descartan, y una sesión posterior del mismo usuario puede reutilizarlos.
+
 ## 4. Mensaje privado
 
 Solicitud:
@@ -139,67 +156,7 @@ El servidor envía el mensaje a todos los integrantes del grupo, incluido el rem
 
 Para las operaciones `GROUP_JOIN`, `GROUP_LEAVE` y `GROUP_SEND`, el servidor responde con un `ACK` usando el mismo `requestId`.
 
-## 6. Directorios para la interfaz de chat
-
-Estos eventos son enviados por el servidor sin una solicitud directa del cliente.
-Permiten construir la vista de grupos, personas y miembros.
-
-### Lista de grupos
-
-```json
-{
-  "type": "GROUP_LIST",
-  "groups": [
-    {
-      "groupId": "distribuidos",
-      "name": "Distribuidos"
-    }
-  ]
-}
-```
-
-El servidor debe publicar `GROUP_LIST` después de `CONNECT` y cuando cambie la lista de grupos.
-
-### Miembros de un grupo
-
-```json
-{
-  "type": "GROUP_MEMBERS",
-  "groupId": "distribuidos",
-  "members": [
-    {
-      "userId": "ana"
-    },
-    {
-      "userId": "bob"
-    }
-  ]
-}
-```
-
-El servidor debe publicar `GROUP_MEMBERS` después de `CONNECT` y cuando cambien los integrantes del grupo.
-
-### Lista de personas
-
-```json
-{
-  "type": "USERS_LIST",
-  "users": [
-    {
-      "userId": "ana"
-    },
-    {
-      "userId": "bob"
-    }
-  ]
-}
-```
-
-El servidor debe publicar `USERS_LIST` después de `CONNECT` y cuando cambie la lista de usuarios disponibles.
-
-Estos eventos no llevan `requestId` porque son notificaciones del servidor. Los clientes no deben inventar grupos ni personas si todavía no reciben estos eventos.
-
-## 7. Errores
+## 6. Errores
 
 Todos los errores tienen esta forma:
 
@@ -219,19 +176,34 @@ Códigos iniciales:
 - `NOT_CONNECTED`: el cliente aún no se ha identificado.
 - `USER_ALREADY_CONNECTED`: el usuario ya está conectado.
 - `USER_NOT_FOUND`: el destinatario no existe.
+- `USER_DISCONNECTED`: el destinatario existe pero no está conectado.
 - `GROUP_NOT_FOUND`: el grupo no existe.
 - `NOT_GROUP_MEMBER`: el usuario no pertenece al grupo.
 - `DUPLICATE_REQUEST`: el `requestId` ya fue utilizado.
 
-## 8. Orden y entrega
+### Destinatario no disponible
 
-- Los mensajes de una misma cola de salida se envían en orden FIFO.
+El servidor no tiene registro permanente de usuarios: un usuario existe mientras tiene una sesión activa. Para poder distinguir los dos casos, el servidor conserva en memoria el conjunto de `userId` que se han conectado desde que arrancó.
+
+- El nombre nunca se ha visto: `USER_NOT_FOUND`.
+- El nombre se ha visto pero no tiene sesión activa: `USER_DISCONNECTED`.
+
+Ese conjunto se pierde al reiniciar el servidor, igual que el resto del estado.
+
+En un `PRIVATE_SEND` que no se puede entregar, el remitente recibe **un solo `ERROR`** y ningún `ACK`. El servidor recibió el mensaje, pero desde el punto de vista del remitente la operación falló, y enviar las dos respuestas obligaría a cada cliente a manejar un `ACK` que puede desmentirse después.
+
+En un `GROUP_SEND` el comportamiento es distinto: **no se emite ningún error** por los integrantes que no estén conectados. El mensaje llega a los presentes y el remitente recibe su `ACK` normal.
+
+## 7. Orden y entrega
+
+- Los mensajes de una misma conexión se procesan y se entregan en el mismo orden en que fueron enviados. La garantía es de extremo a extremo: la sostienen TCP en el transporte y el servidor en el procesamiento.
+- **No se define orden entre remitentes distintos.** Si dos clientes escriben al mismo tiempo, no hay un reloj común que permita decidir cuál fue primero, y el servidor no impone ninguno.
 - El servidor asigna `messageId` a los mensajes aceptados.
 - La entrega es en memoria y no persistente.
 - Si un cliente se desconecta, sus mensajes pendientes se pierden en esta primera versión.
 - No se garantiza entrega después de una desconexión.
 
-## 9. Responsabilidades del servidor
+## 8. Responsabilidades del servidor
 
 El servidor debe:
 
@@ -243,7 +215,7 @@ El servidor debe:
 6. Enviar `ACK`, eventos o `ERROR`.
 7. Mantener usuarios, conexiones y grupos en memoria.
 
-## 10. Responsabilidades de cada cliente
+## 9. Responsabilidades de cada cliente
 
 Cada cliente debe:
 
@@ -256,7 +228,7 @@ Cada cliente debe:
 - Mostrar los errores recibidos.
 - No asumir que un `read` TCP contiene exactamente un mensaje.
 
-## 11. Prueba independiente
+## 10. Prueba independiente
 
 Antes de conectar al servidor real, cada cliente puede probarse contra un mock server que:
 
@@ -267,9 +239,11 @@ Antes de conectar al servidor real, cada cliente puede probarse contra un mock s
 - Envíe mensajes privados y grupales simulados.
 - Envíe errores de prueba.
 
-## 12. Decisiones fuera del alcance
+## 11. Decisiones fuera del alcance
 
 - No se usará navegador ni WebSocket en esta primera versión.
 - No se almacenará historial en una base de datos.
 - No se implementará autenticación avanzada.
 - No se implementará recuperación de mensajes después de una desconexión.
+- No se implementará detección de caída sucia. Si un cliente pierde la conexión sin cerrarla, TCP no avisa y el servidor lo seguirá considerando conectado durante varios minutos. En ese lapso el usuario no puede volver a entrar, porque su nueva conexión recibirá `USER_ALREADY_CONNECTED`. Un latido periódico o un tiempo de inactividad lo resolverían.
+- No se implementará límite de tasa por cliente.
