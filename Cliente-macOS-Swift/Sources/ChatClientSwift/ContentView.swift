@@ -83,7 +83,8 @@ struct ContentView: View {
         .frame(minWidth: 1_180, minHeight: 760)
         .onChange(of: client.isProtocolConnected) { isConnected in
             if !isConnected {
-                selectedConversation = nil
+                // Se descarta el borrador porque ya no se puede enviar, pero la
+                // conversación sigue abierta para poder releer el historial.
                 draft = ""
             }
         }
@@ -275,10 +276,17 @@ private struct PeopleSidebar: View {
     }
 
     private var displayedPeople: [ChatUser] {
-        guard let selectedConversation, case .group(let groupID) = selectedConversation else {
-            return users
+        let people: [ChatUser]
+        if let selectedConversation, case .group(let groupID) = selectedConversation {
+            people = groupMembers[groupID] ?? []
+        } else {
+            people = users
         }
-        return groupMembers[groupID] ?? []
+
+        // El usuario actual puede aparecer en USERS_LIST o GROUP_MEMBERS,
+        // pero no es un destinatario privado válido para esta interfaz.
+        let normalizedCurrentUserID = currentUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return people.filter { $0.id != normalizedCurrentUserID }
     }
 
     var body: some View {
@@ -457,7 +465,10 @@ private struct ConversationPane: View {
                     .frame(width: 34, height: 34)
             }
             .buttonStyle(.borderedProminent)
-            .buttonBorderShape(.circle)
+            // buttonBorderShape(.circle) y (.capsule) exigen macOS 14, y el
+            // paquete apunta a macOS 13; recortar la forma no tiene esa
+            // restricción y con un marco cuadrado da el mismo círculo.
+            .clipShape(Circle())
             .disabled(!canSend)
             .help("Enviar mensaje")
         }
@@ -588,7 +599,7 @@ private struct JoinGroupPopover: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Abrir grupo")
                 .font(.headline)
-            Text("Escribe un groupId para enviar GROUP_JOIN. El grupo aparecerá en el panel si el servidor publica GROUP_LIST.")
+            Text("Escribe un groupId para enviar GROUP_JOIN. El cliente abre y conserva la conversación aunque el servidor aún no publique GROUP_LIST.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -19,7 +19,7 @@ import uuid
 from typing import Any, Iterable
 
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import simpledialog
 
 
 JsonObject = dict[str, Any]
@@ -212,7 +212,17 @@ class ChatClient:
     def send_private(self, recipient: str, text: str) -> str:
         """Envía un mensaje privado y devuelve su ``requestId``."""
 
-        return self._send_operation("PRIVATE_SEND", to=recipient, text=text)
+        normalized_recipient = recipient.strip()
+        if not normalized_recipient:
+            raise ValueError("El destinatario no puede estar vacío")
+        if normalized_recipient == self.user_id:
+            raise ValueError("No puedes enviarte un mensaje privado a ti mismo")
+        if not text.strip():
+            raise ValueError("El mensaje privado no puede estar vacío")
+
+        return self._send_operation(
+            "PRIVATE_SEND", to=normalized_recipient, text=text
+        )
 
     def join_group(self, group_id: str) -> str:
         """Solicita unirse al grupo indicado."""
@@ -261,11 +271,9 @@ class ChatClient:
         decoder = JsonLineDecoder()
         try:
             while not self._stop_event.is_set():
-                try:
-                    chunk = sock.recv(4096)
-                except socket.timeout:
-                    continue
-
+                # El socket quedó en modo bloqueante tras connect(); close()
+                # lo despierta con shutdown, no con un timeout.
+                chunk = sock.recv(4096)
                 if not chunk:
                     break
 
@@ -896,20 +904,24 @@ class ChatApp:
         )
 
     def _handle_group_list(self, event: JsonObject) -> None:
-        entries = parse_group_list(event)
         if "groups" not in event:
             self.connection_status_var.set(
                 "GROUP_LIST recibido sin el campo groups"
             )
             return
 
-        previous_manual = {
-            group_id: self._groups[group_id]
-            for group_id in self._manual_groups
-            if group_id in self._groups
+        entries = parse_group_list(event)
+        # El listado del servidor manda, pero no puede borrar grupos añadidos a
+        # mano ni aquellos donde ya hay conversación abierta: perderlos dejaría
+        # mensajes visibles sin forma de seleccionarlos.
+        preserved = {
+            group_id: label
+            for group_id, label in self._groups.items()
+            if group_id in self._manual_groups
+            or ("group", group_id) in self._messages
         }
         self._groups = dict(entries)
-        self._groups.update(previous_manual)
+        self._groups.update(preserved)
         self._refresh_group_list()
         self.connection_status_var.set(
             f"Grupos publicados por el servidor: {len(entries)}"
@@ -939,7 +951,16 @@ class ChatApp:
             )
             return
 
+        # Igual que con los grupos: quien ya escribió por privado sigue en la
+        # lista aunque el servidor deje de publicarlo, para no dejar huérfana
+        # una conversación con mensajes.
+        preserved = {
+            user_id: label
+            for user_id, label in self._users.items()
+            if ("private", user_id) in self._messages
+        }
         self._users = dict(parse_users_list(event))
+        self._users.update(preserved)
         if self._selected and self._selected[0] == "private":
             selected_id = self._selected[1]
             self._users.setdefault(selected_id, selected_id)
@@ -956,18 +977,24 @@ class ChatApp:
             else None
         )
         operation = str(event.get("operation", "operación"))
-        if pending:
-            target = (pending["kind"], pending["id"])
+        if not pending:
+            self.connection_status_var.set(
+                f"✓ ACK {operation} (requestId={request_id or '-'})"
+            )
+            return
+
+        # El ACK de un envío solo confirma la recepción del servidor; anunciarlo
+        # como burbuja llenaría el hilo de ruido. Solo las operaciones que
+        # cambian la pertenencia al grupo se anotan en la conversación.
+        if operation in {"GROUP_JOIN", "GROUP_LEAVE"}:
             if operation == "GROUP_JOIN":
                 self._ensure_group(pending["id"], pending["id"])
             self._add_system_message(
-                target,
+                (pending["kind"], pending["id"]),
                 f"✓ {operation} aceptado",
             )
         else:
-            self._add_system_to_current(
-                f"✓ ACK {operation} (requestId={request_id or '-'})"
-            )
+            self.connection_status_var.set(f"✓ {operation} aceptado")
 
     def _handle_server_error(self, event: JsonObject) -> None:
         request_id = event.get("requestId")
@@ -981,6 +1008,12 @@ class ChatApp:
             f"{event.get('message', 'Error recibido')}"
         )
         if pending:
+            # El mensaje privado se pintó de forma optimista al enviarlo; si el
+            # servidor lo rechaza hay que desmentirlo en la propia burbuja.
+            if pending["operation"] == "PRIVATE_SEND":
+                self._mark_message_failed(
+                    (pending["kind"], pending["id"]), request_id
+                )
             self._add_system_message((pending["kind"], pending["id"]), message)
         else:
             self._add_system_to_current(message)
@@ -1289,13 +1322,16 @@ class ChatApp:
             return
 
         outgoing = direction == "outgoing"
+        failed = bool(message.get("failed"))
         bubble = tk.Frame(
             row,
             bg=self.COLORS["bubble_out"] if outgoing else self.COLORS["bubble_in"],
             padx=13,
             pady=8,
             highlightbackground=(
-                "#c8e1fb" if outgoing else self.COLORS["border"]
+                self.COLORS["danger"]
+                if failed
+                else ("#c8e1fb" if outgoing else self.COLORS["border"])
             ),
             highlightthickness=1,
         )
@@ -1322,6 +1358,16 @@ class ChatApp:
             wraplength=430,
         ).pack(anchor="w", pady=(3, 0))
 
+        if failed:
+            tk.Label(
+                bubble,
+                text="⚠ El servidor rechazó este mensaje",
+                bg=bubble["bg"],
+                fg=self.COLORS["danger"],
+                font=("TkDefaultFont", 8, "bold"),
+                anchor="w",
+            ).pack(anchor="w", pady=(4, 0))
+
     def _add_message(
         self,
         conversation: tuple[str, str],
@@ -1329,12 +1375,15 @@ class ChatApp:
         direction: str,
         sender: str,
         text: str,
+        request_id: str | None = None,
     ) -> None:
         self._messages.setdefault(conversation, []).append(
             {
                 "direction": direction,
                 "sender": sender,
                 "text": text,
+                "requestId": request_id,
+                "failed": False,
             }
         )
         if direction == "incoming" and conversation != self._selected:
@@ -1343,6 +1392,20 @@ class ChatApp:
             self._render_messages()
         self._refresh_group_list()
         self._refresh_people_list()
+
+    def _mark_message_failed(
+        self,
+        conversation: tuple[str, str],
+        request_id: Any,
+    ) -> None:
+        if not isinstance(request_id, str):
+            return
+        for message in self._messages.get(conversation, []):
+            if message.get("requestId") == request_id:
+                message["failed"] = True
+                break
+        if conversation == self._selected:
+            self._render_messages()
 
     def _add_system_message(
         self,
@@ -1431,6 +1494,7 @@ class ChatApp:
                     direction="outgoing",
                     sender="Tú",
                     text=text,
+                    request_id=request_id,
                 )
             else:
                 request_id = self.client.send_group(identifier, text)

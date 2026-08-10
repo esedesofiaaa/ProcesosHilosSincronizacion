@@ -196,6 +196,14 @@ class ChatClientTests(unittest.TestCase):
             finally:
                 client.close()
 
+    def test_private_send_rejects_the_current_user(self) -> None:
+        client = ChatClient("127.0.0.1", 5000, "ana")
+
+        with self.assertRaises(ValueError):
+            client.send_private(" ana ", "Hola")
+
+        self.assertFalse(client.is_open)
+
     def test_reader_publishes_ack_message_and_error_from_one_tcp_chunk(self) -> None:
         fake_socket = FakeSocket()
         with mock.patch("cliente_chat.socket.create_connection", return_value=fake_socket):

@@ -1,0 +1,71 @@
+name: Cliente Python
+
+# Solo corre cuando cambia el cliente de Fedora o este mismo workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cliente-Fedora-Python/**'
+      - '.github/workflows/cliente-python.yml'
+  pull_request:
+    paths:
+      - 'Cliente-Fedora-Python/**'
+      - '.github/workflows/cliente-python.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: Cliente-Fedora-Python
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 es el mínimo real: el código usa `float | None` en firmas.
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Tk y un display virtual
+        run: sudo apt-get update && sudo apt-get install -y tk xvfb
+        working-directory: .
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Comprobar que Tkinter está disponible
+        run: python -c "import tkinter; print(tkinter.TkVersion)"
+
+      - name: Instalar herramientas de análisis
+        run: python -m pip install --upgrade pip pyflakes pytest
+
+      - name: Análisis estático
+        # Detecta nombres no definidos e imports sin usar. Este paso es el que
+        # habría atrapado el `simpledialog` sin importar.
+        run: python -m pyflakes cliente_chat.py test_cliente_chat.py
+
+      - name: Compilar
+        run: python -m compileall -q cliente_chat.py test_cliente_chat.py
+
+      - name: Pruebas unitarias
+        run: python -m pytest test_cliente_chat.py -v
+
+      - name: Smoke test de la interfaz (headless)
+        # Construye la ventana completa sin abrir conexión: verifica que todos
+        # los widgets se arman y que los listados vacíos se renderizan.
+        run: |
+          xvfb-run -a python -c "
+          import tkinter as tk
+          from cliente_chat import ChatApp, ChatClient
+          root = tk.Tk()
+          root.withdraw()
+          app = ChatApp(root, ChatClient('127.0.0.1', 5000, 'ci'))
+          root.update()
+          assert app._groups == {} and app._users == {}, 'no debe inventar grupos ni personas'
+          app._on_close()
+          print('Interfaz construida correctamente')
+          "

@@ -31,6 +31,14 @@ final class ChatConnection: ObservableObject {
     private var configuredUserID = ""
     private var connectWasSent = false
     private var receiveLoopStarted = false
+    /// requestId → destinatario, para poder retirar el mensaje privado que se
+    /// pintó de forma optimista si el servidor responde ERROR.
+    private var pendingPrivateSends: [String: String] = [:]
+    /// Participantes y grupos que ya tienen actividad en esta sesión. El
+    /// servidor puede publicar listados parciales o retirar usuarios/grupos;
+    /// no debemos dejar conversaciones recibidas sin una fila navegable.
+    private var knownPrivateUserIDs = Set<String>()
+    private var knownGroupNames: [String: String] = [:]
 
     func connect(host: String, portText: String, userID: String) {
         let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -54,6 +62,14 @@ final class ChatConnection: ObservableObject {
         }
 
         stopCurrentConnection(recordClosure: false)
+        // Una sesión nueva puede usar otro usuario: el historial anterior ya no
+        // le corresponde.
+        conversationMessages.removeAll()
+        knownPrivateUserIDs.removeAll()
+        knownGroupNames.removeAll()
+        groups.removeAll()
+        users.removeAll()
+        groupMembers.removeAll()
 
         let newConnection = NWConnection(
             host: NWEndpoint.Host(normalizedHost),
@@ -112,6 +128,11 @@ final class ChatConnection: ObservableObject {
             return false
         }
 
+        guard normalizedRecipient != configuredUserID else {
+            reportLocalError("No puedes enviarte un mensaje privado a ti mismo.")
+            return false
+        }
+
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             reportLocalError("El mensaje privado no puede estar vacío.")
             return false
@@ -128,6 +149,8 @@ final class ChatConnection: ObservableObject {
         )
 
         if queued {
+            rememberPrivateUser(normalizedRecipient)
+            pendingPrivateSends[requestID] = normalizedRecipient
             appendConversationMessage(
                 ConversationMessage(
                     id: "local-\(requestID)",
@@ -171,7 +194,7 @@ final class ChatConnection: ObservableObject {
             return false
         }
 
-        return send(
+        let queued = send(
             OutgoingMessage(
                 type: "GROUP_SEND",
                 requestId: nextRequestID(),
@@ -179,6 +202,11 @@ final class ChatConnection: ObservableObject {
                 text: text
             )
         )
+
+        if queued {
+            rememberGroup(normalizedGroupID, name: normalizedGroupID)
+        }
+        return queued
     }
 
     private func sendGroupMembership(type: String, groupID: String) -> Bool {
@@ -192,13 +220,18 @@ final class ChatConnection: ObservableObject {
             return false
         }
 
-        return send(
+        let queued = send(
             OutgoingMessage(
                 type: type,
                 requestId: nextRequestID(),
                 groupId: normalizedGroupID
             )
         )
+
+        if queued, type == "GROUP_JOIN" {
+            rememberGroup(normalizedGroupID, name: normalizedGroupID)
+        }
+        return queued
     }
 
     private func handleConnectionState(_ state: NWConnection.State, from current: NWConnection) {
@@ -362,15 +395,26 @@ final class ChatConnection: ObservableObject {
         case "ACK":
             let operation = stringValue("operation", in: message) ?? "operación"
             let requestID = stringValue("requestId", in: message) ?? "sin requestId"
+            pendingPrivateSends.removeValue(forKey: requestID)
             appendEvent(
                 .acknowledgement,
                 title: "ACK · \(operation)",
                 detail: "requestId: \(requestID)"
             )
         case "PRIVATE_MESSAGE":
-            let sender = stringValue("from", in: message) ?? "desconocido"
+            guard let rawSender = stringValue("from", in: message),
+                  !rawSender.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                appendEvent(
+                    .error,
+                    title: "PRIVATE_MESSAGE inválido",
+                    detail: "El evento requiere un remitente válido en from."
+                )
+                return
+            }
+            let sender = rawSender.trimmingCharacters(in: .whitespacesAndNewlines)
             let text = stringValue("text", in: message) ?? ""
             let messageID = stringValue("messageId", in: message) ?? nextRequestID()
+            rememberPrivateUser(sender)
             appendConversationMessage(
                 ConversationMessage(
                     id: messageID,
@@ -388,10 +432,32 @@ final class ChatConnection: ObservableObject {
                 detail: "\(text)\nmessageId: \(messageID)"
             )
         case "GROUP_MESSAGE":
-            let groupID = stringValue("groupId", in: message) ?? "sin grupo"
-            let sender = stringValue("from", in: message) ?? "desconocido"
+            guard let rawGroupID = stringValue("groupId", in: message),
+                  !rawGroupID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                appendEvent(
+                    .error,
+                    title: "GROUP_MESSAGE inválido",
+                    detail: "El evento requiere un groupId válido."
+                )
+                return
+            }
+            let groupID = rawGroupID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let rawSender = stringValue("from", in: message),
+                  !rawSender.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                appendEvent(
+                    .error,
+                    title: "GROUP_MESSAGE inválido",
+                    detail: "El evento requiere un remitente válido en from."
+                )
+                return
+            }
+            let sender = rawSender.trimmingCharacters(in: .whitespacesAndNewlines)
             let text = stringValue("text", in: message) ?? ""
             let messageID = stringValue("messageId", in: message) ?? nextRequestID()
+            rememberGroup(groupID, name: groupID)
+            if sender != configuredUserID {
+                rememberPrivateUser(sender)
+            }
             appendConversationMessage(
                 ConversationMessage(
                     id: messageID,
@@ -418,10 +484,19 @@ final class ChatConnection: ObservableObject {
             let code = stringValue("code", in: message) ?? "UNKNOWN_ERROR"
             let serverMessage = stringValue("message", in: message) ?? "Sin detalle del servidor."
             let requestID = stringValue("requestId", in: message) ?? "sin requestId"
+            var detail = "\(serverMessage)\nrequestId: \(requestID)"
+
+            // Si el rechazo corresponde a un privado ya pintado, se retira la
+            // burbuja optimista para no dar por entregado lo que no lo fue.
+            if let recipient = pendingPrivateSends.removeValue(forKey: requestID) {
+                conversationMessages.removeAll { $0.id == "local-\(requestID)" }
+                detail += "\nEl mensaje para \(recipient) no se entregó."
+            }
+
             appendEvent(
                 .error,
                 title: "ERROR · \(code)",
-                detail: "\(serverMessage)\nrequestId: \(requestID)"
+                detail: detail
             )
         default:
             appendEvent(
@@ -436,11 +511,12 @@ final class ChatConnection: ObservableObject {
         let entries = listEntries(
             "groups",
             in: message,
-            identifierKeys: ["groupId", "id", "name"],
-            labelKeys: ["name", "groupName", "groupId", "id"]
+            identifierKeys: ["groupId"],
+            labelKeys: ["name", "groupName", "groupId"]
         )
 
         groups = entries.map { ChatGroup(id: $0.id, name: $0.label) }
+        appendKnownGroupsNotPublishedByServer()
         appendEvent(
             .info,
             title: "GROUP_LIST",
@@ -458,11 +534,13 @@ final class ChatConnection: ObservableObject {
             return
         }
 
+        rememberGroup(groupID, name: groupID)
+
         let entries = listEntries(
             "members",
             in: message,
-            identifierKeys: ["userId", "id", "user", "name"],
-            labelKeys: ["userId", "user", "name", "id"]
+            identifierKeys: ["userId"],
+            labelKeys: ["displayName", "name", "userId"]
         )
 
         groupMembers[groupID] = entries.map { ChatUser(id: $0.id) }
@@ -477,11 +555,12 @@ final class ChatConnection: ObservableObject {
         let entries = listEntries(
             "users",
             in: message,
-            identifierKeys: ["userId", "id", "user", "name"],
-            labelKeys: ["userId", "user", "name", "id"]
+            identifierKeys: ["userId"],
+            labelKeys: ["displayName", "name", "userId"]
         )
 
         users = entries.map { ChatUser(id: $0.id) }
+        appendKnownUsersNotPublishedByServer()
         appendEvent(
             .info,
             title: "USERS_LIST",
@@ -510,15 +589,15 @@ final class ChatConnection: ObservableObject {
             }
 
             let identifier = identifierKeys
-                .compactMap { object[$0] as? String }
-                .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .compactMap { stringValue($0, in: object)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
             guard let identifier else {
                 return nil
             }
 
             let label = labelKeys
-                .compactMap { object[$0] as? String }
-                .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .compactMap { stringValue($0, in: object)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
                 ?? identifier
             return (id: identifier, label: label)
         }
@@ -529,6 +608,53 @@ final class ChatConnection: ObservableObject {
 
         if conversationMessages.count > maximumConversationMessages {
             conversationMessages.removeFirst(conversationMessages.count - maximumConversationMessages)
+        }
+    }
+
+    private func rememberPrivateUser(_ userID: String) {
+        let normalizedUserID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedUserID.isEmpty, normalizedUserID != configuredUserID else {
+            return
+        }
+
+        knownPrivateUserIDs.insert(normalizedUserID)
+        if !users.contains(where: { $0.id == normalizedUserID }) {
+            users.append(ChatUser(id: normalizedUserID))
+        }
+    }
+
+    private func appendKnownUsersNotPublishedByServer() {
+        for userID in knownPrivateUserIDs where userID != configuredUserID {
+            if !users.contains(where: { $0.id == userID }) {
+                users.append(ChatUser(id: userID))
+            }
+        }
+    }
+
+    private func rememberGroup(_ groupID: String, name: String) {
+        let normalizedGroupID = groupID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedGroupID.isEmpty else {
+            return
+        }
+
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = normalizedName.isEmpty ? normalizedGroupID : normalizedName
+        knownGroupNames[normalizedGroupID] = displayName
+
+        if let index = groups.firstIndex(where: { $0.id == normalizedGroupID }) {
+            if groups[index].name == normalizedGroupID, displayName != normalizedGroupID {
+                groups[index] = ChatGroup(id: normalizedGroupID, name: displayName)
+            }
+        } else {
+            groups.append(ChatGroup(id: normalizedGroupID, name: displayName))
+        }
+    }
+
+    private func appendKnownGroupsNotPublishedByServer() {
+        for (groupID, name) in knownGroupNames {
+            if !groups.contains(where: { $0.id == groupID }) {
+                groups.append(ChatGroup(id: groupID, name: name))
+            }
         }
     }
 
@@ -591,9 +717,14 @@ final class ChatConnection: ObservableObject {
         receiveLoopStarted = false
         isTransportReady = false
         isProtocolConnected = false
-        conversationMessages.removeAll()
-        groups.removeAll()
-        users.removeAll()
+        pendingPrivateSends.removeAll()
+        // Los listados vivos dejan de ser válidos, pero se reconstruyen con los
+        // participantes y grupos que tienen actividad local. Así el historial
+        // sigue siendo navegable aunque el servidor no republique sus listas.
+        groups = knownGroupNames.map { ChatGroup(id: $0.key, name: $0.value) }
+        users = knownPrivateUserIDs
+            .filter { $0 != configuredUserID }
+            .map { ChatUser(id: $0) }
         groupMembers.removeAll()
         statusText = status
 
@@ -627,7 +758,22 @@ final class ChatConnection: ObservableObject {
         "swift-\(UUID().uuidString.lowercased())"
     }
 
-    private func stringValue(_ key: String, in message: [String: Any]) -> String? {
-        message[key] as? String
+}
+
+/// El contrato define estos campos como texto, pero un `messageId` numérico no
+/// debe perderse en silencio: se normaliza a String.
+private func stringValue(_ key: String, in message: [String: Any]) -> String? {
+    guard let rawValue = message[key] else {
+        return nil
     }
+
+    if let text = rawValue as? String {
+        return text
+    }
+
+    if let number = rawValue as? NSNumber {
+        return number.stringValue
+    }
+
+    return nil
 }
