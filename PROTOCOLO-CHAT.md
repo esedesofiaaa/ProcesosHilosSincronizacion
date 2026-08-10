@@ -156,6 +156,56 @@ El servidor envía el mensaje a todos los integrantes del grupo, incluido el rem
 
 Para las operaciones `GROUP_JOIN`, `GROUP_LEAVE` y `GROUP_SEND`, el servidor responde con un `ACK` usando el mismo `requestId`.
 
+## 5.1 Eventos de directorio
+
+El servidor publica quién está conectado y qué grupos existen. Son eventos: el cliente no los solicita, llegan solos cuando el estado cambia.
+
+Sin ellos la interfaz no tiene forma de ofrecer destinatarios, así que un servidor que no los emita deja a los clientes sin panel de personas ni de grupos.
+
+### `USERS_LIST`
+
+Se envía a todos los conectados cuando alguien entra o sale.
+
+```json
+{
+  "type": "USERS_LIST",
+  "users": [
+    { "userId": "ana" },
+    { "userId": "bob" }
+  ]
+}
+```
+
+### `GROUP_LIST`
+
+Se envía a todos los conectados cuando se crea un grupo o cuando queda vacío y desaparece. También se envía al cliente que acaba de conectarse.
+
+```json
+{
+  "type": "GROUP_LIST",
+  "groups": [
+    { "groupId": "distribuidos", "name": "distribuidos" }
+  ]
+}
+```
+
+### `GROUP_MEMBERS`
+
+Se envía a los integrantes de un grupo cuando su composición cambia.
+
+```json
+{
+  "type": "GROUP_MEMBERS",
+  "groupId": "distribuidos",
+  "members": [
+    { "userId": "ana" },
+    { "userId": "bob" }
+  ]
+}
+```
+
+Los tres listados son completos, no incrementales: reemplazan lo que el cliente tuviera.
+
 ## 6. Errores
 
 Todos los errores tienen esta forma:
