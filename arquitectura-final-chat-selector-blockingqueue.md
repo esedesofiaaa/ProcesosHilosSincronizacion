@@ -221,23 +221,45 @@ Cliente C -> OutputQueue C
 
 Las colas de salida son `ConcurrentLinkedQueue` y no `BlockingQueue`, porque nadie se bloquea sobre ellas: el worker agrega sin esperar y el Selector retira sin esperar.
 
-El registro de clientes es un mapa concurrente, porque lo leen todos los workers:
+### No hay un mapa de colas de salida
+
+Una primera versión de este diseño tenía una estructura aparte para las colas:
 
 ```java
-Map<String, ClientState> clients = new ConcurrentHashMap<>();
+Map<ClientId, BlockingQueue<ByteBuffer>> outputQueues;   // descartado
+```
+
+Eso obliga a mantener dos mapas en paralelo, uno con los clientes y otro con sus colas, y a borrarlos siempre juntos. Olvidar uno de los dos deja una cola huérfana que nadie vaciará nunca.
+
+En su lugar, la cola de salida es un campo del propio cliente, igual que su cola personal de entrada:
+
+```java
+class ClientState {
+    Queue<Task> pending;              // entrada: mensajes por procesar
+    Queue<ByteBuffer> outputQueue;    // salida: respuestas por enviar
+    // ...
+}
+```
+
+Así una sola búsqueda devuelve todo lo del cliente, y al cerrar la conexión basta con soltar el `ClientState`: se lleva sus dos colas con él.
+
+El único registro que hace falta es el de sesiones activas, y es concurrente porque lo leen todos los workers:
+
+```java
+Map<String, ClientState> connectedUsers = new ConcurrentHashMap<>();
 ```
 
 El worker agrega una respuesta:
 
 ```java
-ClientState destino = clients.get(destinationId);
+ClientState destino = connectedUsers.get(destinationId);
 if (destino == null) {
     // Privado: se responde ERROR al remitente.
     // Grupal: no se entrega y no se emite error.
     return;
 }
 destino.outputQueue.offer(responseBuffer);
-pendingCommands.offer(new EnableWrite(destinationId));
+pendingCommands.offer(new EnableWrite(destino));
 selector.wakeup();
 ```
 
