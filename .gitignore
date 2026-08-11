@@ -6,3 +6,13 @@ __pycache__/
 # Swift
 .build/
 .swiftpm/
+
+# macOS
+.DS_Store
+
+# Artefactos de compilación Java
+target/
+*.class
+
+# Temporales de Office
+~$*
