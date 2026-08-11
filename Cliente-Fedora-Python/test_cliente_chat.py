@@ -5,8 +5,8 @@ import time
 import unittest
 from unittest import mock
 
-from cliente_chat import (
-    ChatClient,
+from chat_client import ChatClient
+from chat_protocol import (
     JsonLineDecoder,
     ProtocolDecodeError,
     encode_message,
@@ -14,6 +14,7 @@ from cliente_chat import (
     parse_group_members,
     parse_users_list,
 )
+from chat_session import ChatSession
 
 
 class FakeSocket:
@@ -154,7 +155,7 @@ class OptionalDirectoryUiTests(unittest.TestCase):
 class ChatClientTests(unittest.TestCase):
     def test_connect_is_first_and_operations_use_unique_request_ids(self) -> None:
         fake_socket = FakeSocket()
-        with mock.patch("cliente_chat.socket.create_connection", return_value=fake_socket):
+        with mock.patch("chat_client.socket.create_connection", return_value=fake_socket):
             client = ChatClient("fedora-host", 7341, "ana")
             try:
                 client.connect()
@@ -204,9 +205,10 @@ class ChatClientTests(unittest.TestCase):
 
         self.assertFalse(client.is_open)
 
+
     def test_reader_publishes_ack_message_and_error_from_one_tcp_chunk(self) -> None:
         fake_socket = FakeSocket()
-        with mock.patch("cliente_chat.socket.create_connection", return_value=fake_socket):
+        with mock.patch("chat_client.socket.create_connection", return_value=fake_socket):
             client = ChatClient("127.0.0.1", 5000, "ana")
             try:
                 client.connect()
@@ -254,6 +256,48 @@ class ChatClientTests(unittest.TestCase):
             except queue.Empty:
                 break
         return len(received) == 3
+
+
+class ChatSessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.session = ChatSession(ChatClient("127.0.0.1", 5000, "ana"))
+
+    def test_unknown_private_sender_remains_navigable_after_users_list(self) -> None:
+        self.session.handle_event(
+            {
+                "type": "PRIVATE_MESSAGE",
+                "from": "carol",
+                "text": "Hola ana",
+            }
+        )
+
+        self.assertEqual(self.session.users["carol"], "carol")
+        self.assertIn(("private", "carol"), self.session.messages)
+
+        self.session.handle_event(
+            {"type": "USERS_LIST", "users": [{"userId": "bob"}]}
+        )
+        self.assertIn("carol", self.session.users)
+
+    def test_unknown_group_message_remains_navigable_after_group_list(self) -> None:
+        self.session.handle_event(
+            {
+                "type": "GROUP_MESSAGE",
+                "groupId": "distribuidos",
+                "from": "bob",
+                "text": "Hola grupo",
+            }
+        )
+
+        self.assertIn("distribuidos", self.session.groups)
+        self.assertIn(("group", "distribuidos"), self.session.messages)
+
+        self.session.handle_event({"type": "GROUP_LIST", "groups": []})
+        self.assertIn("distribuidos", self.session.groups)
+
+    def test_session_does_not_allow_selecting_current_user(self) -> None:
+        self.assertFalse(self.session.select_private("ana"))
+        self.assertIsNone(self.session.selected)
 
 
 if __name__ == "__main__":
